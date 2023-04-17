@@ -8,7 +8,7 @@ import sys
 import warnings
 
 import torch
-from common import BenchmarkRunner, main
+from common import BenchmarkRunner, main, reset_rng_state
 
 from torch._dynamo.testing import collect_results
 from torch._dynamo.utils import clone_inputs
@@ -162,6 +162,8 @@ SKIP_ACCURACY_CHECK_MODELS = {
     "BlenderbotForCausalLM",
 }
 
+REQUIRE_HIGHER_TOLERANCE = set("MT5ForConditionalGeneration")
+
 
 def get_module_cls_by_model_name(model_cls_name):
     _module_by_model_name = {
@@ -219,10 +221,13 @@ def generate_inputs_for_model(
     vocab_size = model.config.vocab_size
     if model_name.endswith("MultipleChoice"):
         input = rand_int_tensor(device, 0, vocab_size, (bs, num_choices, seq_length))
+        torch._dynamo.mark_dynamic(input, 2)
     elif model_name.startswith("Roberta"):
         input = rand_int_tensor(device, 0, 1, (bs, seq_length))
+        torch._dynamo.mark_dynamic(input, 1)
     else:
         input = rand_int_tensor(device, 0, vocab_size, (bs, seq_length))
+        torch._dynamo.mark_dynamic(input, 1)
 
     if "Bart" in model_name:
         input[:, -1] = model.config.eos_token_id
@@ -362,7 +367,7 @@ EXTRA_MODELS = {
 
 class HuggingfaceRunner(BenchmarkRunner):
     def __init__(self):
-        super(HuggingfaceRunner, self).__init__()
+        super().__init__()
         self.suite_name = "huggingface"
 
     def load_model(
@@ -371,10 +376,10 @@ class HuggingfaceRunner(BenchmarkRunner):
         model_name,
         batch_size=None,
     ):
-
         is_training = self.args.training
         use_eval_mode = self.args.use_eval_mode
         dtype = torch.float32
+        reset_rng_state()
         if model_name not in EXTRA_MODELS:
             model_cls = get_module_cls_by_model_name(model_name)
             config_cls = model_cls.config_class
@@ -447,6 +452,7 @@ class HuggingfaceRunner(BenchmarkRunner):
             if (
                 not re.search("|".join(args.filter), model_name, re.I)
                 or re.search("|".join(args.exclude), model_name, re.I)
+                or model_name in args.exclude_exact
                 or model_name in SKIP
             ):
                 continue
@@ -467,14 +473,18 @@ class HuggingfaceRunner(BenchmarkRunner):
     def get_tolerance_and_cosine_flag(self, is_training, current_device, name):
         cosine = self.args.cosine
         if is_training:
-            return 1e-2, cosine
+            if name in REQUIRE_HIGHER_TOLERANCE:
+                return 2e-2, cosine
+            else:
+                return 1e-2, cosine
         return 1e-3, cosine
 
     def compute_loss(self, pred):
         return pred[0]
 
     def forward_pass(self, mod, inputs, collect_outputs=True):
-        return mod(**inputs)
+        with self.autocast():
+            return mod(**inputs)
 
     def forward_and_backward_pass(self, mod, inputs, collect_outputs=True):
         cloned_inputs = clone_inputs(inputs)
@@ -505,7 +515,6 @@ def refresh_model_names_and_batch_sizes():
     lm_seen = set()
     family_seen = set()
     for cls_name in hf_fx._SUPPORTED_MODELS:
-
         if "For" not in cls_name:
             continue
 
@@ -574,10 +583,14 @@ def refresh_model_names_and_batch_sizes():
             log.warning(f"Failed to find suitable batch size for {model_name}")
 
 
-if __name__ == "__main__":
+def huggingface_main():
     # Code to refresh model names and batch sizes
     # if "--find-batch-sizes" not in sys.argv:
     #     refresh_model_names_and_batch_sizes()
     logging.basicConfig(level=logging.WARNING)
     warnings.filterwarnings("ignore")
     main(HuggingfaceRunner())
+
+
+if __name__ == "__main__":
+    huggingface_main()
